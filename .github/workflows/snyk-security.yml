@@ -1,0 +1,236 @@
+name: Snyk Security Scan
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  security-events: write
+
+jobs:
+  snyk-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Run Snyk scan
+        id: snyk-test
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk test --json --severity-threshold=low > snyk-results.json 2>&1
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Parse results and annotate PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // --- Load Snyk results ---
+            let results;
+            try {
+              const raw = fs.readFileSync('snyk-results.json', 'utf8');
+              results = JSON.parse(raw);
+            } catch (e) {
+              core.warning('Could not parse Snyk results: ' + e.message);
+              return;
+            }
+
+            const projects = Array.isArray(results) ? results : [results];
+
+            // --- Aggregate vulnerabilities ---
+            const seen = new Set();
+            const vulns = { critical: [], high: [], medium: [], low: [] };
+            let totalDeps = 0;
+
+            for (const project of projects) {
+              totalDeps += project.dependencyCount || 0;
+              for (const v of (project.vulnerabilities || [])) {
+                if (seen.has(v.id)) continue;
+                seen.add(v.id);
+                const sev = v.severity || 'medium';
+                if (vulns[sev]) vulns[sev].push(v);
+              }
+            }
+
+            const counts = {
+              critical: vulns.critical.length,
+              high: vulns.high.length,
+              medium: vulns.medium.length,
+              low: vulns.low.length
+            };
+            const total = counts.critical + counts.high + counts.medium + counts.low;
+
+            // --- Create GitHub Check Run with annotations ---
+            const annotations = [];
+            const allVulns = [...vulns.critical, ...vulns.high, ...vulns.medium];
+
+            for (const v of allVulns.slice(0, 50)) {
+              const depPath = (v.from || []).join(' → ');
+              const fix = v.isUpgradable ? 'Upgrade path available' :
+                          v.isPatchable ? 'Patch available' : 'No fix available';
+              const epss = v.epssDetails ?
+                `EPSS: ${(parseFloat(v.epssDetails.probability) * 100).toFixed(1)}% (${v.epssDetails.percentile}th percentile)` : '';
+
+              annotations.push({
+                path: 'package.json',
+                start_line: 1,
+                end_line: 1,
+                annotation_level: v.severity === 'critical' ? 'failure' :
+                                  v.severity === 'high' ? 'warning' : 'notice',
+                title: `${v.severity.toUpperCase()}: ${v.title}`,
+                message: [
+                  `Package: ${v.packageName}@${v.version}`,
+                  `CVSS: ${v.cvssScore || 'N/A'}`,
+                  epss,
+                  `Dependency path: ${depPath}`,
+                  `Fix: ${fix}`,
+                  v.identifiers?.CVE?.[0] || ''
+                ].filter(Boolean).join('\n')
+              });
+            }
+
+            const head_sha = context.payload.pull_request?.head?.sha || context.sha;
+
+            for (let i = 0; i < annotations.length; i += 50) {
+              const batch = annotations.slice(i, i + 50);
+              const isLast = i + 50 >= annotations.length;
+
+              if (i === 0) {
+                var checkRun = await github.rest.checks.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'Snyk Security Scan',
+                  head_sha,
+                  status: isLast ? 'completed' : 'in_progress',
+                  conclusion: isLast ? (counts.critical > 0 ? 'failure' :
+                                        counts.high > 0 ? 'action_required' : 'success') : undefined,
+                  output: {
+                    title: `${total} vulnerabilities found (${counts.critical} critical, ${counts.high} high)`,
+                    summary: `Scanned ${totalDeps} dependencies across ${projects.length} project(s).`,
+                    annotations: batch
+                  }
+                });
+              } else {
+                await github.rest.checks.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  check_run_id: checkRun.data.id,
+                  status: isLast ? 'completed' : 'in_progress',
+                  conclusion: isLast ? (counts.critical > 0 ? 'failure' :
+                                        counts.high > 0 ? 'action_required' : 'success') : undefined,
+                  output: {
+                    title: `${total} vulnerabilities found (${counts.critical} critical, ${counts.high} high)`,
+                    summary: `Scanned ${totalDeps} dependencies across ${projects.length} project(s).`,
+                    annotations: batch
+                  }
+                });
+              }
+            }
+
+            // --- Post PR comment with summary ---
+            if (context.eventName === 'pull_request') {
+              const topFindings = [...vulns.critical, ...vulns.high].slice(0, 10);
+
+              let findingsTable = '| Severity | Package | Version | Title | CVSS | Fix Available |\n';
+              findingsTable += '|----------|---------|---------|-------|------|---------------|\n';
+
+              for (const v of topFindings) {
+                const fix = v.isUpgradable ? '✅ Upgrade' : v.isPatchable ? '🔧 Patch' : '❌ No';
+                findingsTable += `| ${v.severity.toUpperCase()} | \`${v.packageName}\` | ${v.version} | ${v.title} | ${v.cvssScore || '-'} | ${fix} |\n`;
+              }
+
+              const comment = [
+                '## 🔒 Snyk Security Scan Results',
+                '',
+                '| Severity | Count |',
+                '|----------|-------|',
+                `| 🔴 Critical | **${counts.critical}** |`,
+                `| 🟠 High | **${counts.high}** |`,
+                `| 🟡 Medium | **${counts.medium}** |`,
+                `| 🔵 Low | **${counts.low}** |`,
+                `| **Total** | **${total}** |`,
+                '',
+                `> Scanned **${totalDeps}** dependencies across **${projects.length}** project(s)`,
+                '',
+                '### Top Findings (Critical + High)',
+                '',
+                findingsTable,
+                '',
+                '---',
+                '',
+                '#### Why this matters for the platform',
+                '- Developers see security findings **in the PR**, not in a separate tool',
+                '- Merge decisions are informed by vulnerability data **before code ships**',
+                '- The platform becomes the single pane of glass for code quality AND security',
+                '',
+                '*Scan powered by [Snyk](https://snyk.io) — integrated via GitHub Actions*'
+              ].join('\n');
+
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number
+              });
+
+              const existing = comments.find(c => c.body.includes('Snyk Security Scan Results'));
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body: comment
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: comment
+                });
+              }
+            }
+
+            // --- Workflow summary ---
+            core.summary
+              .addHeading('Snyk Scan Summary')
+              .addTable([
+                [{data: 'Severity', header: true}, {data: 'Count', header: true}],
+                ['Critical', String(counts.critical)],
+                ['High', String(counts.high)],
+                ['Medium', String(counts.medium)],
+                ['Low', String(counts.low)]
+              ])
+              .write();
+
+            if (counts.critical > 0) {
+              core.setFailed(`${counts.critical} critical vulnerabilities found`);
+            }
+
+      - name: Save results for dashboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-results
+          path: snyk-results.json
+          retention-days: 90
